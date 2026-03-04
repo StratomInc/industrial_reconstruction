@@ -20,6 +20,7 @@ from tf2_ros.buffer import Buffer
 from tf2_ros import TransformListener
 import open3d as o3d
 import numpy as np
+import cv2
 
 from pyquaternion import Quaternion
 from collections import deque
@@ -27,7 +28,7 @@ from os.path import exists, join, isfile
 from sensor_msgs.msg import Image, CameraInfo
 from message_filters import ApproximateTimeSynchronizer, Subscriber
 from src.industrial_reconstruction.utility.file import make_clean_folder, write_pose, read_pose, save_intrinsic_as_json, make_folder_keep_contents
-from industrial_reconstruction_msgs.srv import StartReconstruction, StopReconstruction
+from industrial_reconstruction_msgs.srv import StartReconstruction, StopReconstruction, PublishMesh
 from src.industrial_reconstruction.utility.ros import getIntrinsicsFromMsg, meshToRos, transformStampedToVectors
 
 # ROS Image message -> OpenCV2 image converter
@@ -66,7 +67,7 @@ class IndustrialReconstruction(Node):
         # See Open3d function create_from_color_and_depth for more details #
         ####################################################################
         # The ratio to scale depth values. The depth values will first be scaled and then truncated.
-        self.depth_scale = 1000.0
+        self.depth_scale = 1.0
         # Depth values larger than depth_trunc gets truncated to 0. The depth values will first be scaled and then truncated.
         self.depth_trunc = 3.0
         # Whether to convert RGB image to intensity image.
@@ -96,6 +97,10 @@ class IndustrialReconstruction(Node):
         self.declare_parameter("camera_info_topic")
         self.declare_parameter("cache_count", 10)
         self.declare_parameter("slop", 0.01)
+        self.declare_parameter("fame_count_threshold", 30)
+        self.declare_parameter("depth_scale", 1000.0)
+        self.declare_parameter("depth_trunc", 3.0)
+        self.declare_parameter("processed_frame_count_threshold", 50)
 
         try:
             self.depth_image_topic = str(self.get_parameter('depth_image_topic').value)
@@ -117,6 +122,22 @@ class IndustrialReconstruction(Node):
             self.slop = float(self.get_parameter('slop').value)
         except:
             self.get_logger().info("Failed to load slop parameter")
+        try:
+            self.frame_count_threshold = int(self.get_parameter('frame_count_threshold').value)
+        except:
+            self.get_logger().info("Failed to load fame_count_threshold parameter")
+        try:
+            self.depth_scale = float(self.get_parameter('depth_scale').value)
+        except:
+            self.get_logger().info("Failed to load depth_scale parameter")
+        try:
+            self.depth_trunc = float(self.get_parameter('depth_trunc').value)
+        except:
+            self.get_logger().info("Failed to load depth_trunc parameter")
+        try:
+            self.processed_frame_count_threshold = int(self.get_parameter('processed_frame_count_threshold').value)
+        except:
+            self.get_logger().info("Failed to load processed_frame_count_threshold parameter")
         allow_headerless = False
 
         self.get_logger().info("depth_image_topic - " + self.depth_image_topic)
@@ -144,6 +165,8 @@ class IndustrialReconstruction(Node):
                                                 self.startReconstructionCallback)
         self.stop_server = self.create_service(StopReconstruction, 'stop_reconstruction',
                                                self.stopReconstructionCallback)
+        self.pub_mesh = self.create_service(PublishMesh, 'publish_mesh',
+                                               self.publishMeshCallback)
 
 
     def archiveData(self, path_output):
@@ -298,21 +321,37 @@ class IndustrialReconstruction(Node):
         res.success = True
         res.message = "Mesh Saved to " + req.mesh_filepath
         return res
+    
+    def publishMeshCallback(self, req, res):
+        try:
+            mesh = o3d.io.read_triangle_mesh(req.file_path)
+        except Exception as e:
+            self.get_logger().error("Error opening mesh file: " + str(e))
+        else:
+            mesh_msg = meshToRos(mesh)
+            mesh_msg.header.frame_id = req.mesh_frame
+            self.mesh_pub.publish(mesh_msg)
+            res.success = True
+            return res
+        
+        res.success = False
+        return res
 
     def cameraCallback(self, depth_image_msg, rgb_image_msg):
         if self.record:
             try:
                 # Convert your ROS Image message to OpenCV2
                 # TODO: Generalize image type
-                cv2_depth_img = self.bridge.imgmsg_to_cv2(depth_image_msg, "16UC1")
+                cv2_depth_img = self.bridge.imgmsg_to_cv2(depth_image_msg, depth_image_msg.encoding)
                 cv2_rgb_img = self.bridge.imgmsg_to_cv2(rgb_image_msg, rgb_image_msg.encoding)
+                cv2_rgb_img = cv2.cvtColor(cv2_rgb_img, cv2.COLOR_BGRA2RGB)
             except CvBridgeError:
                 self.get_logger().error("Error converting ros msg to cv img")
                 return
             else:
                 self.sensor_data.append(
                     [o3d.geometry.Image(cv2_depth_img), o3d.geometry.Image(cv2_rgb_img), rgb_image_msg.header.stamp])
-                if (self.frame_count > 30):
+                if (self.frame_count > self.frame_count_threshold):
                     data = self.sensor_data.popleft()
                     try:
                         gm_tf_stamped = self.buffer.lookup_transform(self.relative_frame, self.tracking_frame, data[2])
@@ -346,7 +385,7 @@ class IndustrialReconstruction(Node):
                                 self.tsdf_volume.integrate(rgbd, self.intrinsics, np.linalg.inv(rgb_pose))
                                 self.integration_done = True
                                 self.processed_frame_count += 1
-                                if self.processed_frame_count % 50 == 0:
+                                if self.processed_frame_count % self.processed_frame_count_threshold == 0:
                                     mesh = self.tsdf_volume.extract_triangle_mesh()
                                     if self.crop_mesh:
                                         cropped_mesh = mesh.crop(self.crop_box)
