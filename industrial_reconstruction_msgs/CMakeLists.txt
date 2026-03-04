@@ -20,6 +20,7 @@ set(msg_files
     "msg/NormalFilterParams.msg")
 
 set(srv_files
+    "srv/PublishMesh.srv"
     "srv/StartReconstruction.srv"
     "srv/StopReconstruction.srv")
 
