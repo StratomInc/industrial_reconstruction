@@ -97,7 +97,7 @@ class IndustrialReconstruction(Node):
         self.declare_parameter("camera_info_topic")
         self.declare_parameter("cache_count", 10)
         self.declare_parameter("slop", 0.01)
-        self.declare_parameter("fame_count_threshold", 30)
+        self.declare_parameter("frame_count_threshold", 30)
         self.declare_parameter("depth_scale", 1000.0)
         self.declare_parameter("depth_trunc", 3.0)
         self.declare_parameter("processed_frame_count_threshold", 50)
