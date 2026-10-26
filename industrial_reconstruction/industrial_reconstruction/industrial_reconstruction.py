@@ -14,8 +14,10 @@
 
 import sys
 import rclpy
+import rclpy.parameter
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, HistoryPolicy, ReliabilityPolicy, DurabilityPolicy
+from rcl_interfaces.msg import SetParametersResult
 from tf2_ros.buffer import Buffer
 from tf2_ros import TransformListener
 import open3d as o3d
@@ -62,6 +64,10 @@ class IndustrialReconstruction(Node):
         self.relative_frame = ''
         self.translation_distance = 0.05  # 5cm
         self.rotational_distance = 0.01  # Quaternion Distance
+        
+        # Initialize mesh merge attributes
+        self.merge_with_existing_mesh = False
+        self.existing_mesh_filepath = ""
 
         ####################################################################
         # See Open3d function create_from_color_and_depth for more details #
@@ -101,6 +107,8 @@ class IndustrialReconstruction(Node):
         self.declare_parameter("depth_scale", 1000.0)
         self.declare_parameter("depth_trunc", 3.0)
         self.declare_parameter("processed_frame_count_threshold", 50)
+        self.declare_parameter("merge_with_existing_mesh", False)
+        self.declare_parameter("existing_mesh_filepath", "")
 
         try:
             self.depth_image_topic = str(self.get_parameter('depth_image_topic').value)
@@ -138,6 +146,15 @@ class IndustrialReconstruction(Node):
             self.processed_frame_count_threshold = int(self.get_parameter('processed_frame_count_threshold').value)
         except:
             self.get_logger().info("Failed to load processed_frame_count_threshold parameter")
+        try:
+            self.merge_with_existing_mesh = bool(self.get_parameter('merge_with_existing_mesh').value)
+        except:
+            self.get_logger().info("Failed to load merge_with_existing_mesh parameter")
+        try:
+            self.existing_mesh_filepath = str(self.get_parameter('existing_mesh_filepath').value)
+        except:
+            self.get_logger().info("Failed to load existing_mesh_filepath parameter")
+            
         allow_headerless = False
 
         self.get_logger().info("depth_image_topic - " + self.depth_image_topic)
@@ -152,14 +169,14 @@ class IndustrialReconstruction(Node):
 
         self.info_sub = self.create_subscription(CameraInfo, self.camera_info_topic, self.cameraInfoCallback, 10)
 
-        publisher_qos = QoSProfile(
+        self.publisher_qos = QoSProfile(
             reliability=ReliabilityPolicy.RELIABLE,
             durability=DurabilityPolicy.TRANSIENT_LOCAL,
             history=HistoryPolicy.KEEP_LAST,
             depth=1
         )
-        self.mesh_pub = self.create_publisher(Marker, "industrial_reconstruction_mesh", publisher_qos)
-        self.tsdf_volume_pub = self.create_publisher(Marker, "tsdf_volume", publisher_qos)
+        self.mesh_pub = self.create_publisher(Marker, "industrial_reconstruction_mesh", self.publisher_qos)
+        self.tsdf_volume_pub = self.create_publisher(Marker, "tsdf_volume", self.publisher_qos)
 
         self.start_server = self.create_service(StartReconstruction, 'start_reconstruction',
                                                 self.startReconstructionCallback)
@@ -167,6 +184,9 @@ class IndustrialReconstruction(Node):
                                                self.stopReconstructionCallback)
         self.pub_mesh = self.create_service(PublishMesh, 'publish_mesh',
                                                self.publishMeshCallback)
+        
+        # Register dynamic parameter update callback
+        self.add_on_set_parameters_callback(self.parameterCallback)
 
 
     def archiveData(self, path_output):
@@ -188,7 +208,7 @@ class IndustrialReconstruction(Node):
 
 
     def startReconstructionCallback(self, req, res):
-        self.get_logger().info(" Start Reconstruction")
+        self.get_logger().info("Start Reconstruction")
 
         self.color_images.clear()
         self.depth_images.clear()
@@ -284,6 +304,19 @@ class IndustrialReconstruction(Node):
           return res
 
         mesh = self.tsdf_volume.extract_triangle_mesh()
+        
+        # Merge with existing mesh if path is valid and file exists
+        if self.merge_with_existing_mesh and self.existing_mesh_filepath and exists(self.existing_mesh_filepath):
+            self.get_logger().info(f"Merging new scan with existing mesh from: {self.existing_mesh_filepath}")
+            try:
+                existing_mesh = o3d.io.read_triangle_mesh(self.existing_mesh_filepath)
+                if len(existing_mesh.vertices) > 0:
+                    mesh = existing_mesh + mesh
+                else:
+                    self.get_logger().warn("Existing mesh file was empty, proceeding with new scan mesh only.")
+            except Exception as e:
+                self.get_logger().error(f"Failed to load existing mesh: {str(e)}")
+
         mesh.compute_vertex_normals()
 
         if self.crop_mesh:
@@ -303,13 +336,15 @@ class IndustrialReconstruction(Node):
         triangles_to_remove = cluster_n_triangles[triangle_clusters] < req.min_num_faces
         cropped_mesh.remove_triangles_by_mask(triangles_to_remove)
         cropped_mesh.remove_unreferenced_vertices()
-
+        
+        cropped_mesh.remove_duplicated_vertices()
+        cropped_mesh.remove_duplicated_triangles()
 
         o3d.io.write_triangle_mesh(req.mesh_filepath, cropped_mesh, False, True)
         mesh_msg = meshToRos(cropped_mesh)
         mesh_msg.header.frame_id = self.relative_frame
         self.mesh_pub.publish(mesh_msg)
-        self.get_logger().info("Mesh Saved to " + req.mesh_filepath)
+        self.get_logger().info("Updated Mesh Saved to " + req.mesh_filepath)
 
         if (req.archive_directory != ""):
             self.get_logger().info("Archiving data to " + req.archive_directory)
@@ -319,7 +354,7 @@ class IndustrialReconstruction(Node):
 
         self.get_logger().info("DONE")
         res.success = True
-        res.message = "Mesh Saved to " + req.mesh_filepath
+        res.message = "Updated Mesh Saved to " + req.mesh_filepath
         return res
     
     def publishMeshCallback(self, req, res):
@@ -328,14 +363,34 @@ class IndustrialReconstruction(Node):
         except Exception as e:
             self.get_logger().error("Error opening mesh file: " + str(e))
         else:
+            mesh_pub = self.create_publisher(Marker, req.topic, self.publisher_qos)
             mesh_msg = meshToRos(mesh)
             mesh_msg.header.frame_id = req.mesh_frame
-            self.mesh_pub.publish(mesh_msg)
+            mesh_pub.publish(mesh_msg)
             res.success = True
             return res
         
         res.success = False
         return res
+
+    def parameterCallback(self, params):
+        result = SetParametersResult(successful=True)
+        for param in params:
+            if param.name == 'merge_with_existing_mesh':
+                if param.type_ == rclpy.parameter.Parameter.Type.BOOL:
+                    self.merge_with_existing_mesh = param.value
+                    self.get_logger().info(f"Updated merge_with_existing_mesh parameter to: {self.merge_with_existing_mesh}")
+                else:
+                    result.successful = False
+                    result.reason = "Parameter 'merge_with_existing_mesh' must be of type boolean."
+            elif param.name == 'existing_mesh_filepath':
+                if param.type_ == rclpy.parameter.Parameter.Type.STRING:
+                    self.existing_mesh_filepath = param.value
+                    self.get_logger().info(f"Updated existing_mesh_filepath parameter to: {self.existing_mesh_filepath}")
+                else:
+                    result.successful = False
+                    result.reason = "Parameter 'existing_mesh_filepath' must be of type string."
+        return result
 
     def cameraCallback(self, depth_image_msg, rgb_image_msg):
         if self.record:

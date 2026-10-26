@@ -1,5 +1,6 @@
 string file_path
 string mesh_frame
+string topic
 
 ---
 bool success
